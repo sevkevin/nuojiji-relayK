@@ -70,7 +70,7 @@ function calculateScheduleEffect(actCtx) {
 export function calculateImpulse({
     profile, lifeState, now, lastInteractionAt, scheduleCtx, intensity,
     unansweredStreak = 0, proactiveEnabledAt = 0, proactiveBias = 0,
-    userActiveAt = 0, charUtcOffsetSeconds = null,
+    userActiveAt = 0, charUtcOffsetSeconds = null, userUtcOffsetSeconds = null,
 }) {
     const p = profile || DEFAULT_PROFILE;
     const w = p.weights || {};
@@ -78,8 +78,16 @@ export function calculateImpulse({
     const factors = {};
     let score = 0;
 
-    const hour = (typeof charUtcOffsetSeconds === 'number')
-        ? new Date(now + charUtcOffsetSeconds * 1000).getUTCHours()
+    // 🕒 算「现在几点」永远以用户手机时区为基准，绝不退回服务器时区：
+    //   · 异地角色(charOff 有) → 用 charOff 算角色当地小时。
+    //   · 非异地(charOff=null) → 用 userOff(用户设备时区)。
+    //   · 两者都没有(极旧手机端没传) 才不得已用服务器时区(尽力兜底)。
+    //   中继服务器跑在外地/UTC，用服务器时区会把安静时段/该不该发判全乱。
+    const charOff = (typeof charUtcOffsetSeconds === 'number') ? charUtcOffsetSeconds : null;
+    const userOff = (typeof userUtcOffsetSeconds === 'number') ? userUtcOffsetSeconds : null;
+    const effectiveOff = charOff != null ? charOff : userOff;
+    const hour = (effectiveOff != null)
+        ? new Date(now + effectiveOff * 1000).getUTCHours()
         : new Date(now).getHours();
     const safetyFloorActive = isInSafetyFloor({ lifeState, lastInteractionAt, now, quietHours: p.quietHours, hour });
 

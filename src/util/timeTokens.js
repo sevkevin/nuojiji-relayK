@@ -40,7 +40,14 @@ export function renderTimeTokens(template, timeSpec, nowMs, lastInteractionAt = 
     if (!timeSpec || !s.includes('§NOW_')) return s;
 
     const charOff = (typeof timeSpec.charUtcOffsetSeconds === 'number') ? timeSpec.charUtcOffsetSeconds : null;
-    const p = localParts(nowMs, charOff);
+    const userOff = (typeof timeSpec.userUtcOffsetSeconds === 'number') ? timeSpec.userUtcOffsetSeconds : null;
+    // 🕒 选用哪个偏移算「现在几点」：
+    //   · 异地角色(charOff 有) → 用 charOff，算角色当地时间(原行为)。
+    //   · 非异地(charOff=null) → 用 userOff(用户设备时区)，绝不退回服务器本地时区。
+    //     修 bug(2026-06-07):中继服务器在 UTC/别区，旧逻辑 offset=null 走 getHours() 用了
+    //     服务器时区 → 用户本地 15 点被算成「清晨五点」。userOff 也没有才不得已用服务器时区。
+    const effectiveOff = charOff != null ? charOff : userOff;
+    const p = localParts(nowMs, effectiveOff);
     const period = (Array.isArray(timeSpec.periodTable) && timeSpec.periodTable[p.hour]) || {};
 
     const timeStr = `${pad2(p.hour)}:${pad2(p.minute)}`;
