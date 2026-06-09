@@ -13,7 +13,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { requireSecret } from './util/auth.js';
 import { createOutboxStore } from './store/outboxStore.js';
-import { createSubStore } from './store/subStore.js';
+import { createSubStore, subKey } from './store/subStore.js';
 import { createProactiveStore, PROACTIVE_WINDOW_CAP } from './store/proactiveStore.js';
 import { runGeneration } from './ai/aiCaller.js';
 import { dispatchPush } from './push/pushSender.js';
@@ -137,9 +137,10 @@ export function createApp() {
                 const subs = await sub.list(inboxId);
                 if (!subs.length) return;
                 const title = meta?.charName || '糯叽机';
-                const bodies = item.error
-                    ? ['生成失败，点开查看']
-                    : extractPushBodies(item.content);
+                // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
+                const bodies = meta?.notifPrivacy
+                    ? (item.error ? ['你有一条新消息'] : extractPushBodies(item.content).map(() => '你有一条新消息'))
+                    : (item.error ? ['生成失败，点开查看'] : extractPushBodies(item.content));
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                 let i = 0;
                 for (const body of bodies) {
@@ -211,6 +212,12 @@ export function createApp() {
         try {
             const { sub } = await getStores(c.env);
             await sub.add(inboxId, entry);
+            // apns/fcm 每设备单 token：token 轮换会留下旧行，每条推送/自检都会发两遍。
+            // 注册成功后清掉同 inbox 同 channel 的旧订阅，只保留这条最新的。web 多端共存不清。
+            const ch = entry.channel || 'web';
+            if ((ch === 'apns' || ch === 'fcm') && typeof sub.pruneChannel === 'function') {
+                await sub.pruneChannel(inboxId, ch, subKey(entry));
+            }
         } catch (e) {
             // 把真实异常返回（而非裸 500），便于手机端「检查推送」直接显示后端报错（如 KV 未绑定 / put 失败）。
             return c.json({ error: 'subscribe failed', detail: String(e?.message || e), hasKV: !!(c.env && c.env.OUTBOX) }, 500);
@@ -263,27 +270,16 @@ export function createApp() {
             result.avatarsError = String(e?.message || e);
         }
 
+        // ⚠️ test:true「真发测试推送」已停用。
+        //    现象：有客户端(疑似旧版本/后台保活循环)每 5~10 分钟反复调本端点 test:true，
+        //    每次对每条订阅各发一条「推送链路自检(带头像)」→ 用户被自检通知轰炸。
+        //    诊断本身只需「查订阅是否存在 + 头像 KV 是否在」，不必真发通知。
+        //    故无条件不再 dispatch，只回订阅清单 + 头像状态；UI 拿不到 dispatch 时显示「已停用真发」。
         if (test && subs.length) {
-            // 🔬 带上第一个有头像的 pair 的 avatarUrl，真正测「头像推送」整条链路。
-            const firstAvatar = (result.avatars || []).find(a => a.avatarUrl);
-            const fullUrl = firstAvatar?.avatarUrl
-                ? (firstAvatar.avatarUrl.startsWith('http') ? firstAvatar.avatarUrl : `${new URL(c.req.url).origin}${firstAvatar.avatarUrl}`)
-                : null;
-            const payload = {
-                title: firstAvatar?.charName || '糯叽机', body: '推送链路自检（带头像）', kind: 'relay-diag',
-                avatarUrl: fullUrl, senderName: firstAvatar?.charName || '糯叽机',
-                conversationId: firstAvatar ? `${inboxId}_${firstAvatar.charId}` : null,
-                mutableContent: true,
-            };
-            result.testPayloadAvatarUrl = fullUrl;
-            result.dispatch = [];
-            for (const s of subs) {
-                let res;
-                try { res = await dispatchPush(c.env, s, payload); }
-                catch (e) { res = { ok: false, reason: e?.message || String(e) }; }
-                result.dispatch.push({ channel: s?.channel || 'web', ok: !!res?.ok, gone: !!res?.gone, reason: res?.reason || null });
-                if (res?.gone) await sub.remove(inboxId, s);
-            }
+            result.dispatch = subs.map((s) => ({
+                channel: s?.channel || 'web', ok: null, gone: false,
+                reason: '测试推送已停用(防自检通知轰炸)，本项仅列出订阅是否存在',
+            }));
         }
         return c.json(result);
     });
@@ -331,7 +327,7 @@ export function createApp() {
             inboxId, userId, charId, promptTemplate, proactiveProfile, lifeState,
             intensity, proactiveBias, recentMessages, aiSettings, quietHours,
             charUtcOffsetSeconds, proactiveEnabledAt, lastInteractionAt, enabled,
-            mode, interval, intervalUnit, probability, timeSpec, mcpContextServers, avatarUrl,
+            mode, interval, intervalUnit, probability, timeSpec, mcpContextServers, avatarUrl, notifPrivacy,
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
@@ -352,8 +348,24 @@ export function createApp() {
             timeSpec: timeSpec || null, // 🕒 时间穿透：tick 时用它把 §NOW_*§ 哨兵填成即时真时间
             mcpContextServers: Array.isArray(mcpContextServers) ? mcpContextServers : [], // 🧠 第三方记忆 MCP 直连配置
             avatarUrl: typeof avatarUrl === 'string' ? avatarUrl : null, // 🖼️ 角色头像公开 URL，推送时带给 iOS 通知扩展显示在左侧
+            notifPrivacy: !!notifPrivacy, // 🔒 通知隐私模式：推送时正文换「你有一条新消息」，标题/头像保留
         });
         return c.json({ ok: true });
+    });
+
+    // 🔒 即时刷新本 inbox 所有 pair 的通知隐私标志（用户切开关时调，无需重跑整个注册）。
+    app.post('/proactive/privacy', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, notifPrivacy } = body || {};
+        if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
+        const { proactive } = await getStores(c.env);
+        const recs = (proactive?.listByInbox ? await proactive.listByInbox(inboxId) : []) || [];
+        let updated = 0;
+        for (const r of recs) {
+            if (await proactive.patch(inboxId, String(r.userId), String(r.charId), { notifPrivacy: !!notifPrivacy })) updated++;
+        }
+        return c.json({ ok: true, updated });
     });
 
     // 增量同步滑窗消息 + lifeState + lastInteractionAt（整窗替换，无 delta）
@@ -370,6 +382,20 @@ export function createApp() {
         if (lifeState) patch.lifeState = lifeState;
         if (typeof lastInteractionAt === 'number') patch.lastInteractionAt = lastInteractionAt;
         const ok = await proactive.patch(inboxId, String(userId), String(charId), patch);
+        if (!ok) return c.json({ error: 'pair not registered' }, 404);
+        return c.json({ ok: true });
+    });
+
+    // 🖼️ 单独回写一对的角色头像 URL（不重跑整个注册）。
+    //   手机端「检查推送」发现 NO-avatarUrl-registered 时调，补传头像后回写，无需关开主动消息开关。
+    app.post('/proactive/set-avatar', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, userId, charId, avatarUrl } = body || {};
+        if (!inboxId || userId == null || charId == null) return c.json({ error: 'inboxId / userId / charId required' }, 400);
+        if (typeof avatarUrl !== 'string' || !avatarUrl) return c.json({ error: 'avatarUrl required' }, 400);
+        const { proactive } = await getStores(c.env);
+        const ok = await proactive.patch(inboxId, String(userId), String(charId), { avatarUrl });
         if (!ok) return c.json({ error: 'pair not registered' }, 404);
         return c.json({ ok: true });
     });

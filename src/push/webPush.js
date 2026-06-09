@@ -184,6 +184,11 @@ export async function sendWebPush(env, subscription, payload) {
         });
         if (res.status === 201 || res.status === 200) return { ok: true, gone: false };
         if (res.status === 404 || res.status === 410) return { ok: false, gone: true, reason: `gone ${res.status}` };
+        // 4xx 客户端错误（订阅本身已废：endpoint/密钥失效、记录损坏）也当 gone 删除，
+        // 只放过 429(限流，稍后重试)。否则坏订阅会永远赖在 sub.list 里，每次推送都 400。
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+            return { ok: false, gone: true, reason: `bad-subscription ${res.status}` };
+        }
         return { ok: false, gone: false, reason: `HTTP ${res.status}` };
     } catch (e) {
         return { ok: false, gone: false, reason: e?.message || String(e) };
