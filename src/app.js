@@ -101,8 +101,17 @@ export function createApp() {
 
         const { outbox, sub } = await getStores(c.env);
 
-        // 幂等：同 requestId 在 TTL 内只处理一次
+        // 幂等：同 requestId 在 TTL 内只处理一次。
+        //   H4 修：命中幂等时，若 outbox 里那条结果还在（未被 ack 删）→ 直接【返回它】，让手机端拿到内容；
+        //   只有结果已被取走删除时才回 409。否则旧码一律 409 无内容 → 手机重提交（网络抖/重启）就永久
+        //   拿不到这条回复（6h 内）= 数据丢失。
         if (await outbox.seenRequest(requestId)) {
+            try {
+                const existing = (await outbox.list(inboxId, 0)).find(it => it && String(it.requestId) === String(requestId));
+                if (existing && !existing.error && existing.content) {
+                    return c.json({ accepted: true, requestId, generated: true, replayed: true }, 202);
+                }
+            } catch { /* 查不到就照旧 409 */ }
             return c.json({ duplicate: true, requestId }, 409);
         }
         await outbox.markRequest(requestId);
@@ -134,13 +143,17 @@ export function createApp() {
         // 不含任何提示词逻辑。标题用角色名（手机随 meta 传来）。
         const pushWork = (async () => {
             try {
+                // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
+                //    若这里仍弹「你有一条新消息」→ 用户点进去聊天里却什么都没有 = 假通知。
+                //    失败靠手机端轮询 / 控制台 WARN 暴露即可，不打扰用户。
+                if (item.error) return;
                 const subs = await sub.list(inboxId);
                 if (!subs.length) return;
                 const title = meta?.charName || '糯叽机';
                 // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
                 const bodies = meta?.notifPrivacy
-                    ? (item.error ? ['你有一条新消息'] : extractPushBodies(item.content).map(() => '你有一条新消息'))
-                    : (item.error ? ['生成失败，点开查看'] : extractPushBodies(item.content));
+                    ? extractPushBodies(item.content).map(() => '你有一条新消息')
+                    : extractPushBodies(item.content);
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                 let i = 0;
                 for (const body of bodies) {
@@ -328,9 +341,23 @@ export function createApp() {
             intensity, proactiveBias, recentMessages, aiSettings, quietHours,
             charUtcOffsetSeconds, proactiveEnabledAt, lastInteractionAt, enabled,
             mode, interval, intervalUnit, probability, timeSpec, mcpContextServers, avatarUrl, notifPrivacy,
+            mcpToolServers, mcpProactiveToolUse,
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
+        }
+        // M6：输入大小封顶，防 KV 值过大(25MB 限制)写失败/存储 bloat。promptTemplate 含人设+世界书，
+        //   正常几 KB~几十 KB；给 256KB 上限足够，超了拒绝（多半是异常/恶意输入）。
+        if (typeof promptTemplate === 'string' && promptTemplate.length > 256 * 1024) {
+            return c.json({ error: 'promptTemplate too large (>256KB)' }, 413);
+        }
+        // D：mcpToolServers/mcpContextServers 也封顶（含 cachedTools 的 inputSchema 可能很大），防 KV bloat。
+        for (const [field, val] of [['mcpToolServers', mcpToolServers], ['mcpContextServers', mcpContextServers]]) {
+            if (val != null) {
+                if (Array.isArray(val) && val.length > 32) return c.json({ error: `${field} too many (>32)` }, 413);
+                let sz = 0; try { sz = JSON.stringify(val).length; } catch { /* ignore */ }
+                if (sz > 128 * 1024) return c.json({ error: `${field} too large (>128KB)` }, 413);
+            }
         }
         const { proactive } = await getStores(c.env);
         await proactive.upsert({
@@ -347,6 +374,9 @@ export function createApp() {
             enabled: enabled !== false,
             timeSpec: timeSpec || null, // 🕒 时间穿透：tick 时用它把 §NOW_*§ 哨兵填成即时真时间
             mcpContextServers: Array.isArray(mcpContextServers) ? mcpContextServers : [], // 🧠 第三方记忆 MCP 直连配置
+            // 🛠️ 主动用工具：action-mode MCP server 规格（含 cachedTools）+ 全局开关，tick 时跑 tool-loop。
+            mcpToolServers: Array.isArray(mcpToolServers) ? mcpToolServers : [],
+            mcpProactiveToolUse: !!mcpProactiveToolUse,
             avatarUrl: typeof avatarUrl === 'string' ? avatarUrl : null, // 🖼️ 角色头像公开 URL，推送时带给 iOS 通知扩展显示在左侧
             notifPrivacy: !!notifPrivacy, // 🔒 通知隐私模式：推送时正文换「你有一条新消息」，标题/头像保留
         });
@@ -372,7 +402,7 @@ export function createApp() {
     app.post('/proactive/sync-messages', async (c) => {
         let body;
         try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
-        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt } = body || {};
+        const { inboxId, userId, charId, recentMessages, lifeState, lastInteractionAt, promptTemplate, timeSpec } = body || {};
         if (!inboxId || userId == null || charId == null) {
             return c.json({ error: 'inboxId / userId / charId required' }, 400);
         }
@@ -381,6 +411,10 @@ export function createApp() {
         if (Array.isArray(recentMessages)) patch.recentMessages = recentMessages.slice(-PROACTIVE_WINDOW_CAP);
         if (lifeState) patch.lifeState = lifeState;
         if (typeof lastInteractionAt === 'number') patch.lastInteractionAt = lastInteractionAt;
+        // 🧠 手机端每次往来重建的「与前台同质量」prompt（含最新记忆/总结/世界书/日历）→ patch 覆盖旧模板，
+        //    根治后端代理主动消息上下文不即时。timeSpec 同步刷新（角色名/时段表/异地 offset 可能变）。
+        if (typeof promptTemplate === 'string' && promptTemplate) patch.promptTemplate = promptTemplate;
+        if (timeSpec) patch.timeSpec = timeSpec;
         const ok = await proactive.patch(inboxId, String(userId), String(charId), patch);
         if (!ok) return c.json({ error: 'pair not registered' }, 404);
         return c.json({ ok: true });

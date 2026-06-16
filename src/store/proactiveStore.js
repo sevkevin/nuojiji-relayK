@@ -21,6 +21,9 @@
 export const PROACTIVE_WINDOW_CAP = 30;
 // 后端 cron 触发后的最小静默（防 1 分钟 cron 连发；与手机端冷却独立）
 export const BACKEND_FIRE_COOLDOWN_MS = 20 * 60 * 1000;
+// 生成失败后的短冷却：失败不回退到原值（否则下一分钟 cron 就重试 → API 持续报错时每分钟烧钱），
+//   也不白占满 20min（否则用户要等很久才收到下一条）。设成「失败那刻起 5min 后可再试」。
+export const BACKEND_FAIL_COOLDOWN_MS = 5 * 60 * 1000;
 
 export function makePairKey(inboxId, userId, charId) {
     return `${inboxId}:${String(userId)}:${String(charId)}`;
@@ -53,7 +56,7 @@ export async function createProactiveStore(env) {
 
 // ===== 内存实现（Node 默认）=====
 export class MemoryProactiveStore {
-    constructor() { this.kind = 'memory'; this.map = new Map(); this.pauseMap = new Map(); }
+    constructor() { this.kind = 'memory'; this.map = new Map(); this.pauseMap = new Map(); this.fireMap = new Map(); this._tickLockUntil = 0; this._tickCursor = 0; }
     // inbox 级暂停：走线下剧情时手机端调 /proactive/pause，tick 跳过该 inbox 的所有 pair。
     // 存到点时间戳（pausedUntil），到点自动失效，防手机没发 resume 就永久哑火。
     async setPause(inboxId, pausedUntil) {
@@ -77,10 +80,43 @@ export class MemoryProactiveStore {
         this.map.set(key, { ...prev, ...patch, updatedAt: Date.now() });
         return true;
     }
-    async remove(inboxId, userId, charId) { this.map.delete(makePairKey(inboxId, userId, charId)); }
-    async listEnabled() { return [...this.map.values()].filter(r => r.enabled); }
-    async listByInbox(inboxId) { return [...this.map.values()].filter(r => r.inboxId === inboxId); }
-    async get(inboxId, userId, charId) { return this.map.get(makePairKey(inboxId, userId, charId)) || null; }
+    async remove(inboxId, userId, charId) {
+        const k = makePairKey(inboxId, userId, charId);
+        this.map.delete(k); this.fireMap.delete(k);
+    }
+    // 🔒 lastFiredAt 独立存（与 patch 的整条记录写分开），同 KV 实现：防 sync-messages 覆盖 cron 抢槽。
+    async claimFire(inboxId, userId, charId, now) {
+        this.fireMap.set(makePairKey(inboxId, userId, charId), now || Date.now());
+        return true;
+    }
+    // 🔒 条件抢占（CAS 语义）：只有当前 lastFiredAt 仍在冷却外才抢，返回 true=抢到。
+    //    防「两轮重叠 cron 各拍 tick 开头快照都过冷却闸→同一对双发」：抢槽前【新读】一次,别人刚抢则跳过。
+    async claimFireIfStale(inboxId, userId, charId, now, cooldownMs) {
+        const k = makePairKey(inboxId, userId, charId);
+        const prev = this.fireMap.get(k) || 0;
+        if (prev && (now - prev) < cooldownMs) return false;
+        this.fireMap.set(k, now || Date.now());
+        return true;
+    }
+    async getLastFired(inboxId, userId, charId) {
+        return this.fireMap.get(makePairKey(inboxId, userId, charId)) || 0;
+    }
+    // 🔒 tick 重入锁（单进程，node-cron 已有 _ticking 兜底，这里多一层与 KV 接口对齐）
+    async acquireTickLock(ttlMs = 120000) {
+        if (this._tickLockUntil > Date.now()) return false;
+        this._tickLockUntil = Date.now() + ttlMs;
+        return true;
+    }
+    async releaseTickLock() { this._tickLockUntil = 0; }
+    async getTickCursor() { return this._tickCursor || 0; }
+    async setTickCursor(n) { this._tickCursor = Number(n) || 0; }
+    _withFire(r) { const lf = this.fireMap.get(makePairKey(r.inboxId, r.userId, r.charId)); return lf != null ? { ...r, lastFiredAt: lf } : r; }
+    async listEnabled() { return [...this.map.values()].filter(r => r.enabled).map(r => this._withFire(r)); }
+    async listByInbox(inboxId) { return [...this.map.values()].filter(r => r.inboxId === inboxId).map(r => this._withFire(r)); }
+    async get(inboxId, userId, charId) {
+        const r = this.map.get(makePairKey(inboxId, userId, charId));
+        return r ? this._withFire(r) : null;
+    }
 }
 
 // ===== Cloudflare KV 实现 =====
@@ -137,14 +173,55 @@ class KvProactiveStore {
     async remove(inboxId, userId, charId) {
         const pairKey = makePairKey(inboxId, userId, charId);
         await this.kv.delete(`p:${pairKey}`);
+        await this.kv.delete(`pf:${pairKey}`); // 同步删独立 lastFiredAt key，防残留
         await this._removeFromIdx(pairKey);
+    }
+    // 🔒 cron tick 重入锁：Workers scheduled 无重入守卫，tick 超 60s 时下一轮 cron 会并发，
+    //    两轮对同一 pair 在各自抢槽前都读到旧 lastFiredAt → 双发双扣费。开头抢锁，持有则跳过本轮。
+    //    用短 TTL 防 tick 崩溃后锁永久残留。返回 true=抢到锁，false=已有别的 tick 在跑。
+    async acquireTickLock(ttlMs = 120000) {
+        const existing = await this.kv.get('tick:lock');
+        if (existing && Number(existing) > Date.now()) return false;
+        await this.kv.put('tick:lock', String(Date.now() + ttlMs), { expirationTtl: Math.ceil(ttlMs / 1000) });
+        return true;
+    }
+    async releaseTickLock() { await this.kv.delete('tick:lock'); }
+    async getTickCursor() { const raw = await this.kv.get('tick:cursor'); return raw ? Number(raw) || 0 : 0; }
+    async setTickCursor(n) { await this.kv.put('tick:cursor', String(Number(n) || 0)); }
+    // 🔒 lastFiredAt 拆成【独立 key】`pf:<pairKey>`，与手机 sync-messages 会 patch 的主 blob `p:` 分开。
+    //    根因：主 blob 的 patch 是整条 read-modify-write，cron 抢槽(写 lastFiredAt)与手机 sync(写
+    //    recentMessages/promptTemplate)并发时，sync 用抢槽前的快照覆写 → 抹掉 cron 的 lastFiredAt 抢槽
+    //    → 下轮 cron 冷却闸放行 → 重复主动消息。拆开后两个写者各写各的 key，互不覆盖。
+    async claimFire(inboxId, userId, charId, now) {
+        await this.kv.put(`pf:${makePairKey(inboxId, userId, charId)}`, String(now || Date.now()));
+        return true;
+    }
+    // 🔒 条件抢占（CAS 语义，防两轮重叠 cron 同一对双发）：抢槽前【新读】pf: key，
+    //    仍在冷却外才写。KV 非完全原子(get-then-put)，但窗口从整个 tick 缩到一次读写间，配合长锁趋近零。
+    async claimFireIfStale(inboxId, userId, charId, now, cooldownMs) {
+        const key = `pf:${makePairKey(inboxId, userId, charId)}`;
+        const raw = await this.kv.get(key);
+        const prev = raw ? Number(raw) || 0 : 0;
+        if (prev && (now - prev) < cooldownMs) return false;
+        await this.kv.put(key, String(now || Date.now()));
+        return true;
+    }
+    async getLastFired(inboxId, userId, charId) {
+        const raw = await this.kv.get(`pf:${makePairKey(inboxId, userId, charId)}`);
+        return raw ? Number(raw) || 0 : 0;
     }
     async _all() {
         const idx = await this._getIdx();
         const out = [];
         for (const pairKey of idx) {
             const raw = await this.kv.get(`p:${pairKey}`);
-            if (raw) { try { out.push(JSON.parse(raw)); } catch { /* skip */ } }
+            if (!raw) continue;
+            let rec;
+            try { rec = JSON.parse(raw); } catch { continue; }
+            // 用独立 key 的 lastFiredAt 覆盖 blob 里可能过期的值（blob 的 lastFiredAt 已弃用，只留兼容）
+            const pf = await this.kv.get(`pf:${pairKey}`);
+            if (pf != null) rec.lastFiredAt = Number(pf) || 0;
+            out.push(rec);
         }
         return out;
     }
